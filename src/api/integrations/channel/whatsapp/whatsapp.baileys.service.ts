@@ -748,6 +748,21 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  // Resolves a WhatsApp @lid pseudo-identifier to its real phone-number JID using
+  // Baileys' own lid<->pn store, so callers never persist @lid as remoteJid.
+  // Returns the original jid unchanged if it isn't a @lid or can't be resolved yet.
+  private async resolveLidToPn(jid: string | null | undefined): Promise<string | null> {
+    if (!jid?.endsWith('@lid')) return jid ?? null;
+
+    try {
+      const pn = await this.client?.signalRepository?.lidMapping?.getPNForLID(jid);
+      return pn ? jidNormalizedUser(pn) : null;
+    } catch (error) {
+      this.logger.warn(`[lidResolve] lookup failed for ${jid}: ${error?.message}`);
+      return null;
+    }
+  }
+
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
       const existingChatIds = await this.prismaRepository.chat.findMany({
@@ -757,10 +772,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const existingChatIdSet = new Set(existingChatIds.map((chat) => chat.remoteJid));
 
-      const chatsToInsert = chats
-        .filter((chat) => !existingChatIdSet?.has(chat.id))
-        .map((chat) => ({
-          remoteJid: chat.id,
+      const resolvedChats = await Promise.all(
+        chats.map(async (chat) => ({
+          chat,
+          remoteJid: (await this.resolveLidToPn(chat.id)) ?? chat.id,
+        })),
+      );
+
+      const chatsToInsert = resolvedChats
+        .filter(({ remoteJid }) => !existingChatIdSet?.has(remoteJid))
+        .map(({ chat, remoteJid }) => ({
+          remoteJid,
           instanceId: this.instanceId,
           name: chat.name,
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
@@ -808,9 +830,19 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
-        const contactsRaw: any = contacts.map((contact) => ({
-          remoteJid: contact.id,
-          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+        // Resolve @lid ids to their phone-number JID before any lookup/write below, so we
+        // never create a Contact row keyed by @lid when the real number is knowable.
+        const resolvedJids = await Promise.all(
+          contacts.map(async (contact) => {
+            if (!contact.id?.endsWith('@lid')) return contact.id;
+            if (contact.phoneNumber) return jidNormalizedUser(contact.phoneNumber);
+            return (await this.resolveLidToPn(contact.id)) ?? contact.id;
+          }),
+        );
+
+        const contactsRaw: any = contacts.map((contact, index) => ({
+          remoteJid: resolvedJids[index],
+          pushName: contact?.name || contact?.verifiedName || resolvedJids[index].split('@')[0],
           profilePicUrl: null,
           instanceId: this.instanceId,
         }));
@@ -844,10 +876,10 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         const updatedContacts = await Promise.all(
-          contacts.map(async (contact) => ({
-            remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+          contacts.map(async (contact, index) => ({
+            remoteJid: resolvedJids[index],
+            pushName: contact?.name || contact?.verifiedName || resolvedJids[index].split('@')[0],
+            profilePicUrl: (await this.profilePicture(resolvedJids[index])).profilePictureUrl,
             instanceId: this.instanceId,
           })),
         );
@@ -966,11 +998,43 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         }
 
+        // Resolve @lid ids to phone-number JIDs for this batch before any chat/message write —
+        // history sync previously never resolved @lid at all, unlike the live message path.
+        const lidToJidMap = new Map<string, string>();
+
+        for (const contact of contacts) {
+          if (contact.id?.endsWith('@lid') && contact.phoneNumber) {
+            lidToJidMap.set(contact.id, jidNormalizedUser(contact.phoneNumber));
+          }
+        }
+
+        const unresolvedLids = new Set<string>();
+        for (const chat of chats) {
+          if (chat.id?.endsWith('@lid') && !lidToJidMap.has(chat.id)) unresolvedLids.add(chat.id);
+        }
+        for (const m of messages) {
+          if (m.key?.remoteJid?.endsWith('@lid') && !lidToJidMap.has(m.key.remoteJid)) {
+            unresolvedLids.add(m.key.remoteJid);
+          }
+        }
+        for (const lid of unresolvedLids) {
+          const pn = await this.resolveLidToPn(lid);
+          if (pn) lidToJidMap.set(lid, pn);
+        }
+
+        const resolveHistoryJid = (jid: string) => (jid?.endsWith('@lid') ? (lidToJidMap.get(jid) ?? jid) : jid);
+
         const contactsMap = new Map();
 
         for (const contact of contacts) {
           if (contact.id && (contact.notify || contact.name)) {
-            contactsMap.set(contact.id, { name: contact.name ?? contact.notify, jid: contact.id });
+            const entry = { name: contact.name ?? contact.notify, jid: contact.id };
+            contactsMap.set(contact.id, entry);
+
+            const resolvedContactJid = resolveHistoryJid(contact.id);
+            if (resolvedContactJid !== contact.id) {
+              contactsMap.set(resolvedContactJid, entry);
+            }
           }
         }
 
@@ -982,11 +1046,13 @@ export class BaileysStartupService extends ChannelStartupService {
         );
 
         for (const chat of chats) {
-          if (chatsRepository?.has(chat.id)) {
+          const remoteJid = resolveHistoryJid(chat.id);
+
+          if (chatsRepository?.has(remoteJid)) {
             continue;
           }
 
-          chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
+          chatsRaw.push({ remoteJid, instanceId: this.instanceId, name: chat.name });
         }
 
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
@@ -1032,6 +1098,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (messagesRepository?.has(m.key.id)) {
             continue;
+          }
+
+          if (m.key.remoteJid?.endsWith('@lid')) {
+            const resolvedJid = resolveHistoryJid(m.key.remoteJid);
+            if (resolvedJid !== m.key.remoteJid) {
+              m.key = { ...m.key, remoteJid: resolvedJid, remoteJidAlt: m.key.remoteJid };
+            }
           }
 
           if (!m.pushName && !m.key.fromMe) {
@@ -1175,8 +1248,16 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
+          // Resolve @lid to the phone-number JID *before* any lookup/write below, using the
+          // remoteJidAlt Baileys already annotates on the key when it knows the counterpart.
+          // received.key itself is left untouched so protocol calls (readMessages, placeholder
+          // resync above) keep using whatever addressing WhatsApp actually sent the message with.
+          const rawKey = received.key as ExtendedIMessageKey;
+          const resolvedRemoteJid =
+            rawKey.remoteJid?.includes('@lid') && rawKey.remoteJidAlt ? rawKey.remoteJidAlt : rawKey.remoteJid;
+
           const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: received.key.remoteJid },
+            where: { instanceId: this.instanceId, remoteJid: resolvedRemoteJid },
             select: { id: true, name: true },
           });
 
@@ -1186,7 +1267,7 @@ export class BaileysStartupService extends ChannelStartupService {
             existingChat.name !== received.pushName &&
             received.pushName.trim().length > 0 &&
             !received.key.fromMe &&
-            !received.key.remoteJid.includes('@g.us')
+            !resolvedRemoteJid.includes('@g.us')
           ) {
             this.sendDataWebhook(Events.CHATS_UPSERT, [{ ...existingChat, name: received.pushName }]);
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
@@ -1196,12 +1277,21 @@ export class BaileysStartupService extends ChannelStartupService {
                   data: { name: received.pushName },
                 });
               } catch {
-                console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
+                console.log(`Chat insert record ignored: ${resolvedRemoteJid} - ${this.instanceId}`);
               }
             }
           }
 
-          const messageRaw = this.prepareMessage(received);
+          // Persist with the resolved remoteJid, but never mutate received.key itself — the
+          // protocol calls further down (readMessages, media download) need the original key.
+          // remoteJidAlt is left as Baileys set it (already the phone JID in this case), so
+          // downstream code reading key.remoteJidAlt sees the same value it always did.
+          const messageForPersist =
+            resolvedRemoteJid !== rawKey.remoteJid
+              ? { ...received, key: { ...received.key, remoteJid: resolvedRemoteJid } }
+              : received;
+
+          const messageRaw = this.prepareMessage(messageForPersist);
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;
@@ -1357,7 +1447,7 @@ export class BaileysStartupService extends ChannelStartupService {
             const { pollUpdates, ...messageData } = messageRaw;
             const msg = await this.prismaRepository.message.create({ data: messageData });
 
-            const { remoteJid } = received.key;
+            const remoteJid = resolvedRemoteJid;
             const timestamp = msg.messageTimestamp;
             const fromMe = received.key.fromMe.toString();
             const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
@@ -1412,7 +1502,7 @@ export class BaileysStartupService extends ChannelStartupService {
                     const mimetype = mimeTypes.lookup(fileName).toString();
                     const fullName = join(
                       `${this.instance.id}`,
-                      received.key.remoteJid,
+                      resolvedRemoteJid,
                       mediaType,
                       `${Date.now()}_${fileName}`,
                     );
@@ -1475,9 +1565,6 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
-            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
-          }
           console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
@@ -1490,7 +1577,7 @@ export class BaileysStartupService extends ChannelStartupService {
           });
 
           const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            where: { remoteJid: resolvedRemoteJid, instanceId: this.instanceId },
           });
 
           const contactRaw: {
@@ -1499,9 +1586,9 @@ export class BaileysStartupService extends ChannelStartupService {
             profilePicUrl?: string;
             instanceId: string;
           } = {
-            remoteJid: received.key.remoteJid,
+            remoteJid: resolvedRemoteJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            profilePicUrl: (await this.profilePicture(resolvedRemoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
 
