@@ -930,10 +930,17 @@ export class BaileysStartupService extends ChannelStartupService {
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
+
+        // contacts.update payloads (e.g. profile picture change notifications) often carry
+        // only { id, imgUrl } with no phoneNumber, so resolve @lid via the lidMapping store.
+        const remoteJid = contact.phoneNumber
+          ? jidNormalizedUser(contact.phoneNumber)
+          : ((await this.resolveLidToPn(contact.id)) ?? contact.id);
+
         contactsRaw.push({
-          remoteJid: contact.id,
+          remoteJid,
           pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+          profilePicUrl: (await this.profilePicture(remoteJid)).profilePictureUrl,
           instanceId: this.instanceId,
         });
       }
