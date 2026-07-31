@@ -1786,6 +1786,8 @@ export class ChatwootService {
       albumMessage: msg?.albumMessage
         ? `[álbum: ${msg.albumMessage.expectedImageCount ?? 0} foto(s), ${msg.albumMessage.expectedVideoCount ?? 0} vídeo(s)]`
         : undefined,
+      pollCreationMessage: msg?.pollCreationMessage?.name,
+      groupInviteMessage: msg?.groupInviteMessage?.caption || msg?.groupInviteMessage?.groupName,
     };
 
     return types;
