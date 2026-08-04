@@ -1257,11 +1257,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
           // Resolve @lid to the phone-number JID *before* any lookup/write below, using the
           // remoteJidAlt Baileys already annotates on the key when it knows the counterpart.
+          // Some events (e.g. call-log messages) arrive without remoteJidAlt even though the
+          // lidMapping store already has the pairing (seen from an earlier text message on the
+          // same @lid) — fall back to that store instead of persisting the raw @lid.
           // received.key itself is left untouched so protocol calls (readMessages, placeholder
           // resync above) keep using whatever addressing WhatsApp actually sent the message with.
           const rawKey = received.key as ExtendedIMessageKey;
-          const resolvedRemoteJid =
-            rawKey.remoteJid?.includes('@lid') && rawKey.remoteJidAlt ? rawKey.remoteJidAlt : rawKey.remoteJid;
+          const resolvedRemoteJid = rawKey.remoteJid?.includes('@lid')
+            ? (rawKey.remoteJidAlt ?? (await this.resolveLidToPn(rawKey.remoteJid)) ?? rawKey.remoteJid)
+            : rawKey.remoteJid;
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: resolvedRemoteJid },
