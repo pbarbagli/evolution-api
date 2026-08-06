@@ -1344,7 +1344,12 @@ export class ChatwootService {
             .replaceAll(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```') // Substitui ` por ```
         : body.content;
 
-      const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
+      // body.conversation.messages only ever contains the conversation's last chat message
+      // (Chatwoot's `messages.chat.last`), which is not necessarily the message that fired
+      // this webhook. Only trust its sender's available_name when it really is the triggering
+      // message; otherwise fall back to the top-level sender, which lacks available_name.
+      const triggeringMessage = body?.conversation?.messages?.find((m) => m.id === body.id);
+      const senderName = triggeringMessage?.sender?.available_name || body?.sender?.name;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       instance.instanceId = waInstance.instanceId;
 
@@ -1442,7 +1447,11 @@ export class ChatwootService {
       }
 
       if (body.message_type === 'outgoing' && body?.conversation?.messages?.length && chatId !== '123456') {
-        if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
+        // Use the top-level source_id (the triggering message), not the conversation's last
+        // chat message, which may belong to a different message entirely. When Evolution writes
+        // a WAID back to Chatwoot, the resulting webhook carries that WAID at the top level too,
+        // so loop prevention still works here.
+        if (body?.source_id?.substring(0, 5) === 'WAID:') {
           return { message: 'bot' };
         }
 
@@ -1464,80 +1473,75 @@ export class ChatwootService {
           formatText = textToConcat.join(formattedDelimiter);
         }
 
-        for (const message of body.conversation.messages) {
-          if (message.attachments && message.attachments.length > 0) {
-            for (const attachment of message.attachments) {
-              if (!messageReceived) {
-                formatText = null;
-              }
-
-              const options: Options = {
-                quoted: await this.getQuotedMessage(body, instance),
-              };
-
-              const messageSent = await this.sendAttachment(
-                waInstance,
-                chatId,
-                attachment.data_url,
-                formatText,
-                options,
-              );
-              if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id);
-              }
-
-              await this.updateChatwootMessageId(
-                {
-                  ...messageSent,
-                },
-                {
-                  messageId: body.id,
-                  inboxId: body.inbox?.id,
-                  conversationId: body.conversation?.id,
-                  contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-                },
-                instance,
-              );
+        // Read attachments from the triggering message itself (top-level body.attachments), not
+        // from body.conversation.messages, which only holds the conversation's last chat message
+        // and may belong to an entirely different message than the one that fired this webhook.
+        if (body.attachments && body.attachments.length > 0) {
+          for (const attachment of body.attachments) {
+            if (!messageReceived) {
+              formatText = null;
             }
-          } else {
-            const data: SendTextDto = {
-              number: chatId,
-              text: formatText,
-              delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
+
+            const options: Options = {
               quoted: await this.getQuotedMessage(body, instance),
             };
 
-            sendTelemetry('/message/sendText');
-
-            let messageSent: any;
-            try {
-              messageSent = await waInstance?.textMessage(data, true);
-              if (!messageSent) {
-                throw new Error('Message not sent');
-              }
-
-              if (Long.isLong(messageSent?.messageTimestamp)) {
-                messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
-              }
-
-              await this.updateChatwootMessageId(
-                {
-                  ...messageSent,
-                },
-                {
-                  messageId: body.id,
-                  inboxId: body.inbox?.id,
-                  conversationId: body.conversation?.id,
-                  contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-                },
-                instance,
-              );
-            } catch (error) {
-              if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id, error);
-              }
-              throw error;
+            const messageSent = await this.sendAttachment(waInstance, chatId, attachment.data_url, formatText, options);
+            if (!messageSent && body.conversation?.id) {
+              this.onSendMessageError(instance, body.conversation?.id);
             }
+
+            await this.updateChatwootMessageId(
+              {
+                ...messageSent,
+              },
+              {
+                messageId: body.id,
+                inboxId: body.inbox?.id,
+                conversationId: body.conversation?.id,
+                contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+              },
+              instance,
+            );
+          }
+        } else {
+          const data: SendTextDto = {
+            number: chatId,
+            text: formatText,
+            delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
+            quoted: await this.getQuotedMessage(body, instance),
+          };
+
+          sendTelemetry('/message/sendText');
+
+          let messageSent: any;
+          try {
+            messageSent = await waInstance?.textMessage(data, true);
+            if (!messageSent) {
+              throw new Error('Message not sent');
+            }
+
+            if (Long.isLong(messageSent?.messageTimestamp)) {
+              messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
+            }
+
+            await this.updateChatwootMessageId(
+              {
+                ...messageSent,
+              },
+              {
+                messageId: body.id,
+                inboxId: body.inbox?.id,
+                conversationId: body.conversation?.id,
+                contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+              },
+              instance,
+            );
+          } catch (error) {
+            if (!messageSent && body.conversation?.id) {
+              this.onSendMessageError(instance, body.conversation?.id, error);
+            }
+            throw error;
           }
         }
 
