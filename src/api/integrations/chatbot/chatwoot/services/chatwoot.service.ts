@@ -1782,7 +1782,8 @@ export class ChatwootService {
         msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
         msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
         msg?.message?.viewOnceMessageV2?.message?.audioMessage?.url,
-      templateMessage: msg?.templateMessage?.hydratedTemplate?.hydratedContentText,
+      templateMessage: this.getTemplateMessageText(msg?.templateMessage),
+      templateButtonReplyMessage: msg?.templateButtonReplyMessage?.selectedDisplayText,
       buttonsMessage: msg?.buttonsMessage?.contentText,
       interactiveMessage: msg?.interactiveMessage?.body?.text,
       // AlbumMessage carries no text (WAProto: only expectedImageCount/expectedVideoCount) —
@@ -1795,6 +1796,51 @@ export class ChatwootService {
     };
 
     return types;
+  }
+
+  // Business templates arrive in two shapes: the legacy hydratedTemplate and the newer
+  // interactiveMessageTemplate (body.text + nativeFlowMessage buttons). Buttons are
+  // appended as plain text so links (e.g. cta_url) are not lost in Chatwoot.
+  private getTemplateMessageText(template: any) {
+    if (!template) return undefined;
+
+    const hydrated = template.hydratedTemplate ?? template.hydratedFourRowTemplate;
+    const interactive = template.interactiveMessageTemplate;
+
+    const parts: string[] = [];
+    const buttons: string[] = [];
+
+    if (hydrated) {
+      if (hydrated.hydratedTitleText) parts.push(`*${hydrated.hydratedTitleText}*`);
+      if (hydrated.hydratedContentText) parts.push(hydrated.hydratedContentText);
+      if (hydrated.hydratedFooterText) parts.push(`_${hydrated.hydratedFooterText}_`);
+      for (const b of hydrated.hydratedButtons ?? []) {
+        if (b.urlButton) buttons.push(`🔗 ${b.urlButton.displayText}: ${b.urlButton.url}`);
+        else if (b.callButton) buttons.push(`📞 ${b.callButton.displayText}: ${b.callButton.phoneNumber}`);
+        else if (b.quickReplyButton) buttons.push(`▪️ ${b.quickReplyButton.displayText}`);
+      }
+    } else if (interactive) {
+      if (interactive.header?.title) parts.push(`*${interactive.header.title}*`);
+      if (interactive.body?.text) parts.push(interactive.body.text);
+      if (interactive.footer?.text) parts.push(`_${interactive.footer.text}_`);
+      for (const b of interactive.nativeFlowMessage?.buttons ?? []) {
+        let params: any = {};
+        try {
+          params = JSON.parse(b.buttonParamsJson || '{}');
+        } catch {
+          params = {};
+        }
+        const label = params.display_text || b.name;
+        if (params.url) buttons.push(`🔗 ${label}: ${params.url}`);
+        else if (params.phone_number) buttons.push(`📞 ${label}: ${params.phone_number}`);
+        else if (params.copy_code) buttons.push(`📋 ${label}: ${params.copy_code}`);
+        else if (label) buttons.push(`▪️ ${label}`);
+      }
+    }
+
+    if (buttons.length) parts.push(buttons.join('\n'));
+
+    return parts.length ? parts.join('\n\n') : undefined;
   }
 
   private getMessageContent(types: any) {
